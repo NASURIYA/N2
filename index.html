@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<title>Swiss Racing</title>
+<meta name=viewport content="width=device-width,initial-scale=1,user-scalable=no">
+<style>
+html{background:#0a1f2e}body{position:fixed;top:0;left:0;width:100%;height:100%;margin:0;overflow:hidden;background:#0a1f2e;font-family:system-ui,sans-serif;color:#fff}canvas{display:block;width:100%;height:100%}
+#ui{position:absolute;top:20px;left:20px;font-size:14px;text-shadow:0 2px 4px #000;pointer-events:none}
+#speed{position:absolute;top:20px;right:20px;font-size:36px;font-weight:900;text-align:right;text-shadow:0 2px 4px #000}
+#menu{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);padding:2rem;background:rgba(0,0,0,.85);border-radius:16px;text-align:center;min-width:300px;display:none}
+#menu h1{margin:0 0 1.2em;font-size:2.4em;color:#e74c3b;text-shadow:0 2px 8px rgba(231,76,59,.4)}
+#menu p{margin:.4em 0;color:#ccc}
+.btn{display:inline-block;padding:.8em 2em;margin:.5em 0;background:linear-gradient(180deg,#e74c3b,#c0392b);border:none;border-radius:8px;font-size:1.1em;font-weight:700;cursor:pointer;color:#fff;text-transform:uppercase;letter-spacing:.1em;transition:transform .1s,filter .1s}
+.btn:hover{transform:translateY(-2px);filter:brightness(1.15)}
+.btn:active{transform:translateY(1px);filter:brightness(.9)}
+#hud{position:absolute;top:80px;left:20px;font-size:13px;color:#fff;text-shadow:0 2px 4px #000}
+</style>
+</head>
+<body>
+<canvas id=c></canvas>
+<div id=ui>Swiss Racing<br><span style="color:#e74c3b">WASD + Mouse</span></div>
+<div id=speed>0 km/h</div>
+<div id=menu>
+<h1>Swiss Racing</h1>
+<p>Drive through the Swiss Alps!</p>
+<p><strong>WASD</strong> - Accelerate/Steer</p>
+<p><strong>Mouse</strong> - Look around</p>
+<p><strong>R</strong> - Restart</p>
+<button class=btn onclick=startGame>Start Engine</button>
+</div>
+
+<script>
+// WebGL Setup
+const canvas=document.getElementById('c');
+canvas.width=window.innerWidth;
+canvas.height=window.innerHeight;
+const gl=canvas.getContext('webgl2')||canvas.getContext('webgl');
+if(!gl){alert('WebGL not supported');document.body.className='l e';return}
+
+// Vertex Shader (terrain, car, road)
+const vs=`#version 300 es
+in vec3 a_pos;
+in vec3 a_normal;
+in vec2 a_uv;
+uniform mat4 u_proj;
+uniform mat4 u_view;
+out vec3 v_normal;
+out vec2 v_uv;
+out float v_height;
+void main(){
+  gl_Position=u_view*u_proj*vec4(a_pos,1.0);
+  v_normal=a_normal;
+  v_uv=a_uv;
+  v_height=length(a_pos.y);
+}`;
+
+// Fragment Shader (terrain, road, sky)
+const fs=`#version 300 es
+precision highp float;
+in vec3 v_normal;
+in vec2 v_uv;
+in float v_height;
+uniform vec3 u_lightDir;
+uniform vec3 u_sunColor;
+uniform vec3 u_fogColor;
+uniform float u_fogDensity;
+out vec4 FragColor;
+
+// Simplex noise
+float perm(vec3 p){return fract(sin(dot(p,vec3(12.9898,78.233,55.085)))*43758.5453);}
+float noise(vec3 p){
+  vec3 i=floor(p);
+  vec3 f=fract(p);
+  float n=perm(i)+f.x*perm(i+vec3(1,0,0))+f.y*perm(i+vec3(0,1,0))+f.z*perm(i+vec3(1,1,0));
+  return n*n*(n*(n*6.0-15.0)+10.0);
+}
+float fbm(vec3 p){
+  float v=0.0;
+  float a=.5;
+  vec3 shift=vec3(179.2,184.3,192.1);
+  for(int i=0;i<5;i++){
+    v+=a*noise(p+shift);
+    p*=2.0;
+    shift*=2.0;
+    a*=.5;
+  }
+  return v;
+}
+
+vec3 getTerrain(vec3 pos){
+  float h=fbm(pos*.1)*40.0+fbm(pos*.3)*15.0+fbm(pos*.8)*5.0;
+  vec3 n=normalize(cross(dfdx(h),dfdy(h)));
+  return vec3(pos.x,pos.y+h,pos.z);
+}
+
+void main(){
+  float h=getTerrain(gl_FragCoord.xyz).y;
+  vec3 pos=gl_FragCoord.xyz;
+  vec3 normal=normalize(v_normal);
+  
+  // Sky gradient
+  vec3 sky=vec3(.1,.2,.4)+vec3(.05,.1,.15)*v_height*2.0;
+  
+  // Sun lighting
+  float lightDot=max(dot(normal,u_lightDir),0.0);
+  vec3 color=sky+u_sunColor*lightDot*.8;
+  
+  // Fog
+  float fogDist=u_fogDensity*v_height*10.0;
+  color=mix(color,u_fogColor,fogDist);
+  
+  // Road detection (simple)
+  if(abs(pos.y-h)<2.0){
+    vec3 roadNormal=vec3(0.,-1.,0.);
+    float lightDotRoad=max(dot(roadNormal,u_lightDir),0.0);
+    color=mix(color,vec3(.5,.7,.9)*lightDotRoad*.6,abs(pos.x*2.0+pos.z*1.5)<4.0);
+  }
+  
+  FragColor=vec4(color,1.0);
+}`;
+
+// Compile shader
+function compileShader(type,source){
+  const shader=gl.createShader(type);
+  gl.shaderSource(shader,source);
+  gl.compileShader(shader);
+  if(!gl.getShaderParameter(gl.COMPILE_STATUS)){console.error(gl.getShaderInfoLog(shader));return null}
+  return shader;
+}
+
+const program=gl.createProgram();
+gl.attachShader(program,compileShader(gl.VERTEX_SHADER,vs));
+gl.attachShader(program,compileShader(gl.FRAGMENT_SHADER,fs));
+gl.linkProgram(program);
+if(!gl.getProgramParameter(program.LINK_STATUS)){console.error(gl.getProgramInfoLog(program));return}
+
+// Uniform locations
+const u_proj=gl.getUniformLocation(program,'u_proj');
+const u_view=gl.getUniformLocation(program,'u_view');
+const u_lightDir=gl.getUniformLocation(program,'u_lightDir');
+const u_sunColor=gl.getUniformLocation(program,'u_sunColor');
+const u_fogColor=gl.getUniformLocation(program,'u_fogColor');
+const u_fogDensity=gl.getUniformLocation(program,'u_fogDensity');
+
+// Generate terrain
+function generateTerrain(){
+  const size=200;
+  const detail=64;
+  const vertices=[];
+  const normals=[];
+  const uvs=[];
+  
+  for(let z=0;z<size;z++){
+    for(let x=0;x<size;x++){
+      const nx=x/size-0.5;
+      const nz=z/size-0.5;
+      const pos=vec3(nx*200,nz*200,0);
+      const h=getTerrain(pos).y;
+      
+      vertices.push(x,y,z,h);
+      normals.push(normalize(cross(dfdx(h),dfdy(h))));
+      uvs.push(nx+0.5,nz+0.5);
+    }
+  }
+  
+  return {vertices,indices:generateIndices(size,detail),normals,uvs};
+}
+
+function generateIndices(w,h){
+  const indices=[];
+  for(let z=0;z<h-1;z++){
+    for(let x=0;x<w-1;x++){
+      const a=x+z*w;
+      const b=a+1;
+      const c=a+w;
+      const d=a+w+1;
+      indices.push(a,b,d,c);
+    }
+  }
+  return indices;
+}
+
+// Car model (Ferrari-like)
+function createCar(){
+  const vertices=[];
+  const normals=[];
+  
+  // Body main
+  const body=[
+    [-0.3,-0.2,0.5],[0.3,-0.2,0.5],[0.3,-0.2,-0.5],[-0.3,-0.2,-0.5],
+    [-0.3,0.1,0.5],[0.3,0.1,0.5],[0.3,0.1,-0.5],[-0.3,0.1,-0.5]
+  ];
+  
+  // Cabin
+  const cabin=[
+    [-0.2,0.1,0.4],[0.2,0.1,0.4],[0.2,0.1,-0.4],[-0.2,0.1,-0.4],
+    [-0.2,0.35,0.4],[0.2,0.35,0.4],[0.2,0.35,-0.4],[-0.2,0.35,-0.4]
+  ];
+  
+  // Wheels
+  const wheels=[
+    [-0.35,-0.18,0.45],[-0.35,-0.18,-0.45],[0.35,-0.18,0.45],[0.35,-0.18,-0.45]
+  ];
+  
+  // Wheels (cylinders)
+  for(let i=0;i<wheels.length;i++){
+    const cx=wheels[i][0];
+    const cy=wheels[i][1];
+    const cz=wheels[i][2];
+    
+    for(let a=0;a<360;a+=30){
+      const rad=a*Math.PI/180;
+      const sx=Math.cos(rad);
+      const sy=Math.sin(rad);
+      
+      vertices.push(cx+sx*0.25, cy-0.15, cz+sy*0.25);
+      vertices.push(cx+sx*0.25, cy+0.15, cz+sy*0.25);
+      vertices.push(cx+sx*0.25, cy+0.15, cz-sy*0.25);
+      vertices.push(cx+sx*0.25, cy-0.15, cz-sy*0.25);
+      
+      normals.push(sx,sy,sz);
+      normals.push(-sx,-sy,sz);
+      normals.push(-sx,-sy,-sz);
+      normals.push(sx,sy,-sz);
+    }
+  }
+  
+  // Body faces
+  const bodyFaces=[
+    [0,1,2,3],[4,5,6,7],[0,4,7,3],[1,5,6,2],
+    [0,1,5,4],[2,3,7,6]
+  ];
+  
+  for(let f of bodyFaces){
+    const p=[body[f[0]],body[f[1]],body[f[2]],body[f[3]]];
+    vertices.push(...p);
+    normals.push(0,1,0);
+    normals.push(0,-1,0);
+    normals.push(0,1,0);
+    normals.push(0,-1,0);
+  }
+  
+  // Cabin faces
+  const cabinFaces=[
+    [8,9,10,11],[12,13,14,15],[8,12,15,11],[9,13,14,10]
+  ];
+  
+  for(let f of cabinFaces){
+    const p=[cabin[f[0]],cabin[f[1]],cabin[f[2]],cabin[f[3]]];
+    vertices.push(...p);
+    normals.push(0,1,0);
+    normals.push(0,-1,0);
+    normals.push(0,1,0);
+    normals.push(0,-1,0);
+  }
+  
+  return {vertices:new Float32Array(vertices),normals:new Float32Array(normals)};
+}
+
+// Game state
+let terrain=null;
+let car={x:0,y:0,z:0,vx:0,vy:0,vz:0,speed:0};
+let camera={x:0,y:1.7,z:0,lookX:0,lookY:0};
+let keys={w:false,a:false,s:false,d:false};
+let time=0;
+
+// Input handling
+document.addEventListener('keydown',e=>{
+  if(e.code==='KeyW')keys.w=true;
+  if(e.code==='KeyS')keys.s=true;
+  if(e.code==='KeyA')keys.a=true;
+  if(e.code==='KeyD')keys.d=true;
+  if(e.code==='KeyR')startGame();
+});
+document.addEventListener('keyup',e=>{
+  if(e.code==='KeyW')keys.w=false;
+  if(e.code==='KeyS')keys.s=false;
+  if(e.code==='KeyA')keys.a=false;
+  if(e.code==='KeyD')keys.d=false;
+});
+
+// Mouse look
+document.addEventListener('mousemove',e=>{
+  if(document.pointerLockElement===canvas){
+    camera.lookX+=e.movementX*0.002;
+    camera.lookY+=e.movementY*0.002;
+    camera.lookY=Math.max(-1.5,Math.min(1.5,camera.lookY));
+  }
+});
+
+document.addEventListener('click',()=>{
+  if(document.pointerLockElement!==canvas){
+    document.body.requestPointerLock();
+  }
+});
+
+// Matrix math helpers
+function mat4(){
+  return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);
+}
+function vec3(a,b,c){return new Float32Array([a,b,c]);}
+
+// Perspective projection
+function createProjectionMatrix(fov,aspect,near,far){
+  const f=1.0/Math.tan(fov/2);
+  return new Float32Array([f/aspect,0,0,0,0,f,0,0,0,0,-1/(near-far),-(far+near)/(far-near),0,0,-1]);
+}
+
+// View matrix
+function createViewMatrix(){
+  const cos=Math.cos;const sin=Math.sin;
+  const cx=car.x;const cy=car.y;const cz=car.z;
+  const lx=cos(camera.lookX)*cos(camera.lookY);
+  const ly=sin(camera.lookY);
+  const lz=-cos(camera.lookX)*sin(camera.lookY);
+  
+  return new Float32Array([
+    lx,0,lz,0,
+    0,1,0,0,
+    -lz*lx+ly*lz,ly*lx+lz*ly,-lz*lx-lz*ly,0,
+    -(cx*lx+cz*lz),cy,cx*lz-cz*lx,1
+  ]);
+}
+
+// Start game
+function startGame(){
+  document.getElementById('menu').style.display='none';
+  document.body.requestPointerLock();
+  
+  if(!terrain){
+    terrain=generateTerrain();
+    const carModel=createCar();
+    
+    // Create buffers
+    const vbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+    gl.bufferData(gl.ARRAY_BUFFER,terrain.vertices,gl.STATIC_DRAW);
+    
+    const nbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,nbo);
+    gl.bufferData(gl.ARRAY_BUFFER,terrain.normals,gl.STATIC_DRAW);
+    
+    const ibo=gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ibo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,terrain.indices,gl.STATIC_DRAW);
+    
+    // Car buffer
+    const carVbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,carVbo);
+    gl.bufferData(gl.ARRAY_BUFFER,carModel.vertices,gl.STATIC_DRAW);
+    
+    const carNbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,carNbo);
+    gl.bufferData(gl.ARRAY_BUFFER,carModel.normals,gl.STATIC_DRAW);
+  }
+  
+  // Init car position
+  car.x=0;car.y=0;car.z=0;
+  camera.x=0;camera.y=1.7;camera.z=0;
+}
+
+// Render loop
+function render(){
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0.1,0.2,0.3,1);
+  gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  
+  // Update car physics
+  const accel=0.5;const friction=0.98;const turnSpeed=2.0;
+  if(keys.w)car.speed+=accel;
+  if(keys.s)car.speed-=accel;
+  car.speed=Math.max(0,car.speed*friction);
+  
+  if(car.speed>0){
+    const turn=keys.a?-turnSpeed:keys.d?turnSpeed:0;
+    car.vx=car.speed*Math.sin(turn)*Math.cos(camera.lookX);
+    car.vy=car.speed*Math.cos(turn)*Math.cos(camera.lookX);
+    car.vz=car.speed*Math.sin(turn)*Math.sin(camera.lookX);
+  }
+  
+  car.x+=car.vx;car.y+=car.vy;car.z+=car.vz;
+  
+  // Camera follow
+  const camDist=3.5;const camHeight=1.2;
+  camera.x=car.x+camDist*Math.sin(camera.lookX)*Math.cos(camera.lookY);
+  camera.y=car.y+camHeight;
+  camera.z=car.z+camDist*Math.cos(camera.lookX)*Math.cos(camera.lookY);
+  
+  // Update UI
+  const speedKm=(car.speed*3.6).toFixed(0);
+  document.getElementById('speed').textContent=speedKm+' km/h';
+  
+  // Render terrain
+  if(terrain){
+    gl.useProgram(program);
+    
+    const proj=createProjectionMatrix(Math.PI/4,canvas.width/canvas.height,0.1,200);
+    const view=createViewMatrix();
+    
+    gl.uniform3f(u_lightDir,0.5,-0.7,0.3);
+    gl.uniform3f(u_sunColor,1,0.95,0.85);
+    gl.uniform3f(u_fogColor,0.2,0.3,0.4);
+    gl.uniform1f(u_fogDensity,0.002);
+    
+    gl.uniformMatrix4fv(u_proj,false,true);
+    gl.uniformMatrix4fv(u_view,false,true);
+    
+    const vPos=gl.getAttribLocation(program,'a_pos');
+    const vNorm=gl.getAttribLocation(program,'a_normal');
+    const vUv=gl.getAttribLocation(program,'a_uv');
+    
+    gl.enableVertexAttribArray(vPos);
+    gl.enableVertexAttribArray(vNorm);
+    gl.enableVertexAttribArray(vUv);
+    
+    gl.bindBuffer(gl.ARRAY_BUFFER,terrain.vertices);
+    gl.vertexAttribPointer(vPos,3,false,gl.FALSE,0,0);
+    
+    gl.bindBuffer(gl.ARRAY_BUFFER,terrain.normals);
+    gl.vertexAttribPointer(vNorm,3,false,gl.FALSE,0,0);
+    
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,terrain.indices);
+    gl.drawElements(gl.TRIANGLES,terrain.indices.length,gl.UNSIGNED_SHORT,0);
+  }
+  
+  // Render car
+  if(terrain){
+    const proj=createProjectionMatrix(Math.PI/4,canvas.width/canvas.height,0.1,200);
+    const view=createViewMatrix();
+    
+    gl.useProgram(program);
+    gl.uniformMatrix4fv(u_proj,false,true);
+    gl.uniformMatrix4fv(u_view,false,true);
+    
+    const carVbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,carVbo);
+    gl.bufferData(gl.ARRAY_BUFFER,terrain.vertices,gl.STATIC_DRAW);
+  }
+  
+  requestAnimationFrame(render);
+}
+
+// Init
+window.addEventListener('resize',()=>{
+  canvas.width=window.innerWidth;
+  canvas.height=window.innerHeight;
+});
+
+startGame();
+render();
+</script>
+</body>
+</html>
